@@ -1,0 +1,5 @@
+{
+    "safe_mode": true,
+    "llm_model": "OptGPT-4:latest",
+    "repo_path": "."
+}

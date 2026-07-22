@@ -1,0 +1,7 @@
+/* App-level overrides - intentionally minimal, all styling via Tailwind */
+#root {
+  width: 100%;
+  height: 100vh;
+  margin: 0;
+  padding: 0;
+}
