@@ -23,7 +23,7 @@ class CodeStandardsEngine:
 
     def __init__(self, repo_path: str = "."):
         self.repo_path = os.path.abspath(repo_path)
-        self.standards_file = os.path.join(self.repo_path, ".optcode_standards.json")
+        self.standards_file = os.path.join(self.repo_path, ".codeme_standards.json")
         self.standards = self._load_standards()
 
     def _load_standards(self) -> Dict[str, list]:

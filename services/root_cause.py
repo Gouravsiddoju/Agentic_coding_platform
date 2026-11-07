@@ -1,6 +1,7 @@
 import json
 from typing import Dict, Any
-from services.llm_service import LLMService
+from .llm_service import LLMService
+from .agents import _strip_json
 
 class RootCauseAnalyzer:
     @staticmethod
@@ -24,13 +25,7 @@ class RootCauseAnalyzer:
         response = LLMService.generate_completion(prompt, system_prompt)
         
         try:
-            response = response.strip()
-            if response.startswith("```json"):
-                response = response[7:]
-            if response.endswith("```"):
-                response = response[:-3]
-                
-            analysis = json.loads(response.strip())
+            analysis = json.loads(_strip_json(response))
             return analysis
         except Exception as e:
             return {

@@ -101,8 +101,9 @@ async function startServerAndCreateWindow() {
   }
 
   win = new BrowserWindow({
-    width: 1200,
-    height: 800,
+    width: 1280,
+    height: 860,
+    title: 'CodeMe',
     webPreferences: {
       nodeIntegration: true,
       contextIsolation: false
@@ -114,7 +115,7 @@ async function startServerAndCreateWindow() {
       const html = `
         <html>
           <body style="font-family: system-ui, sans-serif; padding: 3rem; text-align: center; background: #0f172a; color: white;">
-            <h2 style="margin-bottom: 1rem;">Server Not Found</h2>
+            <h2 style="margin-bottom: 1rem;">CodeMe — Server Not Found</h2>
             <p style="color: #94a3b8; margin-bottom: 2rem;">The internal backend failed to start or load.</p>
             <div style="display: flex; justify-content: center; gap: 0.5rem;">
               <input id="serverUrl" type="text" value="${serverUrl}" style="padding: 0.75rem; width: 300px; border-radius: 6px; border: 1px solid #334155; background: #1e293b; color: white;" />

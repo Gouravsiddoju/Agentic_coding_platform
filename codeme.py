@@ -5,6 +5,7 @@ import subprocess
 import json
 from rich.console import Console
 from rich import print
+from rich.table import Table
 from services.repo_intelligence import RepoIntelligenceEngine
 from services.agents import ArchitectAgent, EngineeringAgent, RepairAgent
 from services.verification import VerificationAgent
@@ -15,9 +16,97 @@ from services.events import EventBus, AgentEvent, AgentEventType
 from services.session_manager import SessionManager, SessionStatus
 from services.workspace import WorkspaceManager
 from services.coordinator import CoordinatorAgent
+from services.llm_service import LLMService
+from services.ollama_client import OllamaClient
 
-app = typer.Typer(help="OPTCode v2.0 - Claude Code Inspired MVP")
+app = typer.Typer(help="CodeMe v2.0 - Agentic Coding Platform")
 console = Console()
+
+
+def _require_ollama():
+    """Check Ollama is reachable before any LLM-dependent command runs."""
+    if not OllamaClient.health_check():
+        console.print(
+            "[bold red]Ollama is not running.[/bold red]\n"
+            "Start it with:  [cyan]ollama serve[/cyan]\n"
+            "Then pull a model:  [cyan]ollama pull codellama:7b[/cyan]"
+        )
+        raise typer.Exit(1)
+    models = OllamaClient.list_models()
+    if not models:
+        console.print(
+            "[bold yellow]No models installed in Ollama.[/bold yellow]\n"
+            "Pull one with:  [cyan]ollama pull codellama:7b[/cyan]\n"
+            "Good coding models: codellama:7b, qwen2.5-coder:7b, deepseek-coder:6.7b"
+        )
+        raise typer.Exit(1)
+    current = ConfigManager.get_llm_model()
+    if current not in models:
+        console.print(
+            f"[yellow]Configured model '[bold]{current}[/bold]' is not installed.[/yellow]\n"
+            f"Installed: {models}\n"
+            f"Run [cyan]codeme model set <name>[/cyan] to pick one."
+        )
+        raise typer.Exit(1)
+
+
+@app.command(name="status")
+def status_cmd():
+    """Show Ollama connection status, installed models, and current config."""
+    reachable = OllamaClient.health_check()
+    models = OllamaClient.list_models() if reachable else []
+    current_model = ConfigManager.get_llm_model()
+    embed_model = ConfigManager.get_embed_model()
+    ollama_url = ConfigManager.get_ollama_url()
+
+    console.print(f"\n[bold cyan]CodeMe Status[/bold cyan]")
+    console.print(f"  Ollama URL  : {ollama_url}")
+    console.print(f"  Ollama up   : {'[green]✓[/green]' if reachable else '[red]✗ (run: ollama serve)[/red]'}")
+    console.print(f"  LLM model   : [bold]{current_model}[/bold]" +
+                  (" [green]✓[/green]" if current_model in models else " [red]NOT INSTALLED[/red]"))
+    console.print(f"  Embed model : [bold]{embed_model}[/bold]" +
+                  (" [green]✓[/green]" if embed_model in models else " [red]NOT INSTALLED[/red]"))
+    if models:
+        console.print(f"  Installed   : {', '.join(models)}")
+    console.print()
+
+
+model_app = typer.Typer(help="Manage Ollama models used by CodeMe.")
+app.add_typer(model_app, name="model")
+
+
+@model_app.command(name="list")
+def model_list():
+    """List installed Ollama models."""
+    models = OllamaClient.list_models()
+    if not models:
+        console.print("[yellow]No models installed. Run: ollama pull codellama:7b[/yellow]")
+        return
+    current = ConfigManager.get_llm_model()
+    t = Table(title="Installed Ollama Models")
+    t.add_column("Model", style="cyan")
+    t.add_column("Active?", justify="center")
+    for m in models:
+        t.add_row(m, "[green]✓[/green]" if m == current else "")
+    console.print(t)
+
+
+@model_app.command(name="set")
+def model_set(name: str = typer.Argument(..., help="Model name, e.g. codellama:7b")):
+    """Set the active LLM model for CodeMe."""
+    models = OllamaClient.list_models()
+    if name not in models:
+        console.print(f"[red]Model '{name}' not found. Pull it with: ollama pull {name}[/red]")
+        raise typer.Exit(1)
+    ConfigManager.set_model(name)
+    console.print(f"[green]Active model set to: {name}[/green]")
+
+
+@model_app.command(name="pull")
+def model_pull(name: str = typer.Argument(..., help="Model name to pull, e.g. codellama:7b")):
+    """Pull a model from Ollama registry (runs ollama pull <name>)."""
+    console.print(f"[cyan]Pulling model: {name}[/cyan]")
+    subprocess.run(["ollama", "pull", name], check=False)
 
 @app.command()
 def create(
@@ -25,6 +114,7 @@ def create(
     project_name: str = typer.Argument(..., help="Name of the new project folder"),
     parent_path: str = typer.Option(".", help="Path where the project folder will be created")
 ):
+    _require_ollama()
     print(f"[bold green]Starting project scaffolding for:[/bold green] {project_name}")
     
     target_path = os.path.join(parent_path, project_name)
@@ -71,7 +161,7 @@ def create(
             if Confirm.ask("\nDo you want to make an initial commit?"):
                 with console.status("[yellow]Committing...[/yellow]"):
                     subprocess.run(["git", "add", "."], cwd=target_path, capture_output=True)
-                    subprocess.run(["git", "commit", "-m", "Initial commit via OPTCode"], cwd=target_path, capture_output=True)
+                    subprocess.run(["git", "commit", "-m", "Initial commit via CodeMe"], cwd=target_path, capture_output=True)
                 print("[bold green]Initial commit created![/bold green]")
             return
             
@@ -101,6 +191,7 @@ def implement(
     story: str = typer.Argument(..., help="The user story or requirement to implement"),
     repo_path: str = typer.Option(".", help="Path to the repository")
 ):
+    _require_ollama()
     print(f"[bold green]Starting implementation for:[/bold green] {story}")
     
     # Subscribe CLI to EventBus
@@ -257,7 +348,7 @@ def ship(
     print("[yellow]Creating Pull Request...[/yellow]")
     gitops.create_pull_request(
         title=message,
-        body="This PR was automatically generated by OPTCode AI Software Engineering Agent.",
+        body="This PR was automatically generated by CodeMe AI Software Engineering Agent.",
         head_branch=branch
     )
     
@@ -268,7 +359,7 @@ def interactive_chat(
     repo_path: str = typer.Option(".", help="Path to the repository")
 ):
     """
-    Start an interactive conversational CLI session with OPTCode v2.0 MVP.
+    Start an interactive conversational CLI session with CodeMe.
     """
     
     def compress_history(history: list, max_len: int = 15) -> list:
@@ -295,7 +386,7 @@ def interactive_chat(
             
         return [system_prompt] + history[safe_index:]
 
-    console.print("\n[bold green]Welcome to OPTCode v2.0 Interactive Mode![/bold green]")
+    console.print("\n[bold green]Welcome to CodeMe v2.0 Interactive Mode![/bold green]")
     console.print("Type naturally to chat or request features. I'll automatically figure out what you need!")
     console.print("Available commands:")
     console.print("  [cyan]/help[/cyan]        - Show commands")
@@ -308,7 +399,7 @@ def interactive_chat(
     console.print("  [cyan]/exit[/cyan]        - Leave chat\n")
     
     messages = [
-        {"role": "system", "content": "You are OPTCode, an autonomous AI Software Engineer running directly on the user's local machine. You HAVE full read and write access to their local filesystem and repository. When the user asks for code, your background agents physically create and modify the files on their disk. NEVER say that you cannot create files or that you don't have access to the system, because you do. Be helpful and concise."}
+        {"role": "system", "content": "You are CodeMe, an autonomous AI Software Engineer running directly on the user's local machine. You HAVE full read and write access to their local filesystem and repository. When the user asks for code, your background agents physically create and modify the files on their disk. NEVER say that you cannot create files or that you don't have access to the system, because you do. Be helpful and concise."}
     ]
     
     while True:
@@ -335,7 +426,7 @@ def interactive_chat(
             console.print("  [cyan]/exit[/cyan]        - Leave chat\n")
             continue
         elif cmd == "/clear":
-            messages = [{"role": "system", "content": "You are OPTCode, an expert AI Software Engineer. Be helpful, concise, and guide the user in building software."}]
+            messages = [{"role": "system", "content": "You are CodeMe, an expert AI Software Engineer. Be helpful, concise, and guide the user in building software."}]
             console.print("[green]History cleared.[/green]")
             continue
         elif cmd == "/history":
@@ -361,7 +452,7 @@ def interactive_chat(
             parts = user_input.split(" ", 1)
             msg = parts[1] if len(parts) > 1 else "Auto-generated PR"
             with console.status("[yellow]Creating PR...[/yellow]"):
-                ship(message=msg, branch="feature/optcode-update", repo_path=repo_path)
+                ship(message=msg, branch="feature/codeme-update", repo_path=repo_path)
             continue
         elif cmd.startswith("/open ") or cmd.startswith("/cd "):
             new_path = user_input.split(" ", 1)[1].strip()
@@ -454,7 +545,7 @@ def interactive_chat(
                         messages.append(tool_msg)
                 else:
                     final_text = response_msg.get("content", "")
-                    console.print(f"\n[bold magenta]OPTCode:[/bold magenta] {final_text}\n")
+                    console.print(f"\n[bold magenta]CodeMe:[/bold magenta] {final_text}\n")
                     break
 
 if __name__ == "__main__":

@@ -1,4 +1,5 @@
 import os
+import shlex
 import subprocess
 from typing import Dict, Any, List
 
@@ -79,13 +80,40 @@ class AgentTools:
 
     @staticmethod
     def run_command(command: str) -> str:
+        """
+        Runs a terminal command.
+        Uses shlex.split + shell=False to prevent shell injection.
+        Only a curated set of development-safe command prefixes are allowed.
+        """
+        ALLOWED_PREFIXES = (
+            "npm", "npx", "yarn", "pnpm", "node",
+            "pip", "pip3", "python", "python3",
+            "cargo", "rustc", "go",
+            "git", "tsc",
+            "ls", "dir", "cat", "echo", "touch", "mkdir",
+            "flutter", "dart",
+            "pytest", "flake8", "bandit",
+        )
+        try:
+            parts = shlex.split(command, posix=True)
+        except ValueError:
+            # Windows paths — retry with posix=False
+            parts = shlex.split(command, posix=False)
+
+        if not parts:
+            return "Error: Empty command."
+
+        base_cmd = os.path.basename(parts[0]).lower().replace(".exe", "")
+        if base_cmd not in ALLOWED_PREFIXES:
+            return f"Error: Command '{parts[0]}' is not in the allowed list for agent tool use."
+
         try:
             result = subprocess.run(
-                command, 
-                shell=True, 
-                capture_output=True, 
+                parts,
+                shell=False,
+                capture_output=True,
                 text=True,
-                timeout=60
+                timeout=60,
             )
             output = ""
             if result.stdout:
@@ -97,5 +125,7 @@ class AgentTools:
             return output
         except subprocess.TimeoutExpired:
             return "Error: Command timed out after 60 seconds."
+        except FileNotFoundError:
+            return f"Error: Command '{parts[0]}' not found on PATH."
         except Exception as e:
             return f"Error executing command: {e}"

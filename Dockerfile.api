@@ -1,0 +1,25 @@
+# CodeMe Python FastAPI backend
+FROM python:3.11-slim
+
+WORKDIR /app
+
+# Install system deps (git for GitOpsAgent)
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    git curl \
+    && rm -rf /var/lib/apt/lists/*
+
+# Python deps
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+# App source
+COPY services/ ./services/
+COPY api.py codeme.py ./
+
+# Data directory (conversations.db, sessions, workspaces)
+RUN mkdir -p /app/data
+VOLUME ["/app/data"]
+
+EXPOSE 8007
+
+CMD ["python", "-m", "uvicorn", "api:app", "--host", "0.0.0.0", "--port", "8007"]

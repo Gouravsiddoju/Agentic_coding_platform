@@ -1,0 +1,84 @@
+##############################################################################
+#  CodeMe — Docker Compose
+#
+#  Starts the full stack with one command:
+#    docker compose up
+#
+#  What each service does:
+#    ollama   — local AI server (serves models on :11434)
+#    api      — CodeMe Python FastAPI backend (:8007), talks to ollama
+#    server   — CodeMe Node.js backend (:3000), serves the React UI + WebSocket
+#
+#  First run:
+#    1. docker compose up -d
+#    2. docker compose exec ollama ollama pull codellama:7b
+#    3. docker compose exec ollama ollama pull nomic-embed-text
+#    4. Open http://localhost:3000
+#
+#  To run with GPU acceleration (NVIDIA):
+#    docker compose -f docker-compose.yml -f docker-compose.gpu.yml up
+##############################################################################
+
+services:
+
+  # ── Ollama ─────────────────────────────────────────────────────────────────
+  ollama:
+    image: ollama/ollama:latest
+    container_name: codeme-ollama
+    restart: unless-stopped
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama_data:/root/.ollama
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:11434/"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ── Python FastAPI backend ──────────────────────────────────────────────────
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile.api
+    container_name: codeme-api
+    restart: unless-stopped
+    ports:
+      - "8007:8007"
+    environment:
+      - CODEME_OLLAMA_URL=http://ollama:11434
+      - CODEME_ALLOWED_ORIGINS=http://localhost:3000,http://localhost:5173
+      - CODEME_DATA_DIR=/app/data
+    volumes:
+      - codeme_data:/app/data
+    depends_on:
+      ollama:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8007/api/status"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+
+  # ── Node.js / React server ──────────────────────────────────────────────────
+  server:
+    build:
+      context: ./claudecodeui_src
+      dockerfile: ../Dockerfile.server
+    container_name: codeme-server
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    environment:
+      - SERVER_PORT=3000
+      - DATABASE_PATH=/app/data/auth.db
+      - CODEME_API_URL=http://api:8007
+    volumes:
+      - codeme_data:/app/data
+    depends_on:
+      api:
+        condition: service_healthy
+
+volumes:
+  ollama_data:
+  codeme_data:

@@ -1,10 +1,31 @@
+"""
+CodeMe Python API — FastAPI backend
+
+Features:
+  - WebSocket /ws/chat          → streaming chat with Ollama (token-by-token)
+  - GET  /api/status            → Ollama health + installed models
+  - GET  /api/models            → list installed Ollama models
+  - POST /api/models/set        → set active model
+  - GET  /api/conversations     → list all saved conversations
+  - GET  /api/conversations/{id}→ get one conversation's messages
+  - DEL  /api/conversations/{id}→ delete a conversation
+  - Agent pipelines (IMPLEMENT / CREATE / FIX) via WebSocket
+"""
+
 import json
 import os
 import asyncio
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+import uuid
+import sqlite3
+from datetime import datetime
+from pathlib import Path
+from typing import Optional
+
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import uvicorn
+import requests as _requests   # used only for streaming raw response
 
 from services.intent_router import IntentRouter
 from services.llm_service import LLMService
@@ -14,313 +35,523 @@ from services.agents import ArchitectAgent, EngineeringAgent, RepairAgent
 from services.events import EventBus, AgentEvent, AgentEventType
 from services.session_manager import SessionManager, SessionStatus
 from services.workspace import WorkspaceManager
+from services.ollama_client import OllamaClient
 
-# Chat history is now managed per session in SessionManager, 
-# but for the raw websocket connection we keep a lightweight history cache.
-def load_history() -> list:
-    return None
+# ── CORS ──────────────────────────────────────────────────────────────────────
+_raw_origins = os.getenv(
+    "CODEME_ALLOWED_ORIGINS",
+    "http://localhost:3000,http://localhost:5173,app://."
+)
+ALLOWED_ORIGINS = [o.strip() for o in _raw_origins.split(",") if o.strip()]
 
-def save_history(messages):
-    pass
+# ── Conversation persistence (SQLite) ─────────────────────────────────────────
+_DB_DIR = Path(os.getenv("CODEME_DATA_DIR", Path.home() / ".codeme"))
+_DB_DIR.mkdir(parents=True, exist_ok=True)
+_CONV_DB = _DB_DIR / "conversations.db"
 
-app = FastAPI(title="OPTCode Desktop API", version="2.0.0")
+def _get_conv_db() -> sqlite3.Connection:
+    conn = sqlite3.connect(_CONV_DB)
+    conn.row_factory = sqlite3.Row
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS conversations (
+            id TEXT PRIMARY KEY,
+            title TEXT NOT NULL,
+            model TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS messages (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            conversation_id TEXT NOT NULL,
+            role TEXT NOT NULL,
+            content TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            FOREIGN KEY (conversation_id) REFERENCES conversations(id) ON DELETE CASCADE
+        )
+    """)
+    conn.commit()
+    return conn
 
-# Enable CORS for the React/Electron Frontend
+def _save_conversation(conv_id: str, title: str, model: str, messages: list):
+    conn = _get_conv_db()
+    now = datetime.utcnow().isoformat()
+    conn.execute(
+        "INSERT OR IGNORE INTO conversations (id, title, model, created_at, updated_at) VALUES (?,?,?,?,?)",
+        (conv_id, title, model, now, now)
+    )
+    conn.execute("UPDATE conversations SET updated_at=?, model=? WHERE id=?", (now, model, conv_id))
+    # Re-insert all messages (simpler than diffing for MVP)
+    conn.execute("DELETE FROM messages WHERE conversation_id=?", (conv_id,))
+    for m in messages:
+        if m.get("role") in ("user", "assistant"):
+            conn.execute(
+                "INSERT INTO messages (conversation_id, role, content, created_at) VALUES (?,?,?,?)",
+                (conv_id, m["role"], m.get("content", ""), now)
+            )
+    conn.commit()
+    conn.close()
+
+# ── Per-connection state ───────────────────────────────────────────────────────
+# { ws_id: {"messages": list, "conv_id": str, "title": str} }
+_ws_state: dict = {}
+
+def _get_state(ws_id: int) -> dict:
+    if ws_id not in _ws_state:
+        model = ConfigManager.get_llm_model()
+        _ws_state[ws_id] = {
+            "conv_id": str(uuid.uuid4()),
+            "title": "New conversation",
+            "model": model,
+            "messages": [{
+                "role": "system",
+                "content": (
+                    "You are CodeMe, an autonomous AI Software Engineer running on the user's "
+                    "local machine. You can read/write files and run commands through your agent "
+                    "tools. Be helpful, use rich markdown, and be concise."
+                )
+            }]
+        }
+    return _ws_state[ws_id]
+
+def _persist_state(ws_id: int):
+    s = _ws_state.get(ws_id)
+    if s:
+        _save_conversation(s["conv_id"], s["title"], s["model"], s["messages"])
+
+# ── App ────────────────────────────────────────────────────────────────────────
+app = FastAPI(title="CodeMe Desktop API", version="2.0.0")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=ALLOWED_ORIGINS,
     allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_methods=["GET", "POST", "DELETE", "OPTIONS"],
+    allow_headers=["Content-Type", "Authorization"],
 )
 
+# ── WebSocket broadcast manager ────────────────────────────────────────────────
 class ConnectionManager:
     def __init__(self):
-        self.active_connections = []
+        self.active: list[WebSocket] = []
 
-    async def connect(self, websocket: WebSocket):
-        await websocket.accept()
-        self.active_connections.append(websocket)
+    async def connect(self, ws: WebSocket):
+        await ws.accept()
+        self.active.append(ws)
 
-    def disconnect(self, websocket: WebSocket):
-        if websocket in self.active_connections:
-            self.active_connections.remove(websocket)
+    def disconnect(self, ws: WebSocket):
+        self.active.discard(ws) if hasattr(self.active, "discard") else None
+        if ws in self.active:
+            self.active.remove(ws)
 
-    async def send_message(self, message: dict, websocket: WebSocket):
+    async def send(self, msg: dict, ws: WebSocket):
         try:
-            await websocket.send_json(message)
-        except:
+            await ws.send_json(msg)
+        except Exception:
             pass
-            
-    async def broadcast(self, message: dict):
-        for connection in self.active_connections:
-            await self.send_message(message, connection)
+
+    async def broadcast(self, msg: dict):
+        for ws in list(self.active):
+            await self.send(msg, ws)
 
 manager = ConnectionManager()
 
-# Bridge EventBus to WebSockets
-event_queue = asyncio.Queue()
+# ── EventBus → WebSocket bridge ───────────────────────────────────────────────
+_event_queue: asyncio.Queue = asyncio.Queue()
 
-def event_bus_callback(event: AgentEvent):
-    # This runs in sync threads, we need to put it in the async queue
+def _event_bus_callback(event: AgentEvent):
     try:
         loop = asyncio.get_running_loop()
-        loop.call_soon_threadsafe(event_queue.put_nowait, event)
+        loop.call_soon_threadsafe(_event_queue.put_nowait, event)
     except RuntimeError:
         pass
 
-EventBus.subscribe_all(event_bus_callback)
+EventBus.subscribe_all(_event_bus_callback)
 
-async def event_consumer():
+async def _event_consumer():
     while True:
-        event = await event_queue.get()
+        event = await _event_queue.get()
         await manager.broadcast({
             "type": "agent_event",
             "event_type": event.event_type.value,
             "message": event.message,
             "payload": event.payload,
             "session_id": event.session_id,
-            "timestamp": event.timestamp
+            "timestamp": event.timestamp,
         })
 
+# ── Startup ────────────────────────────────────────────────────────────────────
 @app.on_event("startup")
 async def startup_event():
-    asyncio.create_task(event_consumer())
+    asyncio.create_task(_event_consumer())
+    if OllamaClient.health_check():
+        models = OllamaClient.list_models()
+        print(f"[CodeMe] Ollama connected. Models: {models}")
+    else:
+        print("[CodeMe] WARNING: Ollama not reachable. Run: ollama serve")
 
-def compress_history(history: list, max_len: int = 15) -> list:
+# ── REST endpoints ─────────────────────────────────────────────────────────────
+
+@app.get("/api/status")
+async def api_status():
+    ollama_ok = OllamaClient.health_check()
+    models = OllamaClient.list_models() if ollama_ok else []
+    current_model = ConfigManager.get_llm_model()
+    embed_model = ConfigManager.get_embed_model()
+    return {
+        "status": "ok",
+        "ollama": {
+            "url": ConfigManager.get_ollama_url(),
+            "reachable": ollama_ok,
+            "installed_models": models,
+            "active_model": current_model,
+            "model_ready": current_model in models,
+            "embed_model": embed_model,
+            "embed_model_ready": embed_model in models,
+        },
+    }
+
+@app.get("/api/models")
+async def list_models():
+    """List all locally installed Ollama models."""
+    if not OllamaClient.health_check():
+        raise HTTPException(503, "Ollama is not running")
+    return {"models": OllamaClient.list_models(), "active": ConfigManager.get_llm_model()}
+
+class SetModelRequest(BaseModel):
+    model: str
+
+@app.post("/api/models/set")
+async def set_model(req: SetModelRequest):
+    """Switch the active model. Persists to .codeme config."""
+    models = OllamaClient.list_models()
+    if req.model not in models:
+        raise HTTPException(404, f"Model '{req.model}' not installed. Pull it first.")
+    ConfigManager.set_model(req.model)
+    return {"ok": True, "active": req.model}
+
+@app.get("/api/conversations")
+async def list_conversations():
+    conn = _get_conv_db()
+    rows = conn.execute(
+        "SELECT id, title, model, created_at, updated_at FROM conversations ORDER BY updated_at DESC"
+    ).fetchall()
+    conn.close()
+    return {"conversations": [dict(r) for r in rows]}
+
+@app.get("/api/conversations/{conv_id}")
+async def get_conversation(conv_id: str):
+    conn = _get_conv_db()
+    conv = conn.execute("SELECT * FROM conversations WHERE id=?", (conv_id,)).fetchone()
+    if not conv:
+        conn.close()
+        raise HTTPException(404, "Conversation not found")
+    msgs = conn.execute(
+        "SELECT role, content, created_at FROM messages WHERE conversation_id=? ORDER BY id",
+        (conv_id,)
+    ).fetchall()
+    conn.close()
+    return {"conversation": dict(conv), "messages": [dict(m) for m in msgs]}
+
+@app.delete("/api/conversations/{conv_id}")
+async def delete_conversation(conv_id: str):
+    conn = _get_conv_db()
+    conn.execute("DELETE FROM conversations WHERE id=?", (conv_id,))
+    conn.commit()
+    conn.close()
+    return {"ok": True}
+
+# ── Streaming helper ───────────────────────────────────────────────────────────
+
+async def _stream_chat(messages: list, ws: WebSocket, model: str) -> str:
+    """
+    Streams a chat response from Ollama token-by-token.
+    Sends {"type":"stream_token","token":"..."} frames to the client.
+    Returns the full assembled response string.
+    """
+    ollama_url = ConfigManager.get_ollama_url()
+    payload = {
+        "model": model,
+        "messages": messages,
+        "stream": True,
+        "options": {"num_ctx": int(os.getenv("CODEME_OLLAMA_CTX", "32768"))},
+    }
+
+    full_text = ""
+    await manager.send({"type": "stream_start"}, ws)
+
+    try:
+        # Run the blocking streaming HTTP call in a thread so we don't block the loop
+        def _do_stream():
+            with _requests.post(
+                f"{ollama_url}/api/chat",
+                json=payload,
+                stream=True,
+                timeout=int(os.getenv("CODEME_OLLAMA_TIMEOUT", "300")),
+            ) as resp:
+                resp.raise_for_status()
+                return [line for line in resp.iter_lines() if line]
+
+        lines = await asyncio.to_thread(_do_stream)
+
+        for line in lines:
+            try:
+                chunk = json.loads(line)
+                token = chunk.get("message", {}).get("content", "")
+                if token:
+                    full_text += token
+                    await manager.send({"type": "stream_token", "token": token}, ws)
+                if chunk.get("done"):
+                    break
+            except json.JSONDecodeError:
+                continue
+
+    except Exception as exc:
+        await manager.send({"type": "error", "content": f"Stream error: {exc}"}, ws)
+
+    await manager.send({"type": "stream_end", "content": full_text}, ws)
+    return full_text
+
+# ── Helpers ────────────────────────────────────────────────────────────────────
+
+def _compress(history: list, max_len: int = 20) -> list:
     if len(history) <= max_len:
         return history
-    system_prompt = history[0]
-    safe_index = len(history) - max_len + 1
-    while safe_index < len(history):
-        if history[safe_index].get("role") == "user":
-            break
-        safe_index += 1
-    if safe_index >= len(history):
-        safe_index = len(history) - 5
-    return [system_prompt] + history[safe_index:]
+    sys = history[0]
+    idx = len(history) - max_len + 1
+    while idx < len(history) and history[idx].get("role") != "user":
+        idx += 1
+    if idx >= len(history):
+        idx = len(history) - 5
+    return [sys] + history[idx:]
+
+# ── WebSocket /ws/chat ─────────────────────────────────────────────────────────
 
 @app.websocket("/ws/chat")
 async def websocket_chat(websocket: WebSocket):
     await manager.connect(websocket)
+    ws_id = id(websocket)
+    state = _get_state(ws_id)
     repo_path = "."
-    
-    loaded_messages = load_history()
-    if loaded_messages:
-        messages = loaded_messages
-    else:
-        messages = [
-            {"role": "system", "content": "You are OPTCode, an autonomous AI Software Engineer running directly on the user's local machine via a Desktop Application. You HAVE full read and write access to their local filesystem and repository. When the user asks for code, your background agents physically create and modify the files on their disk. NEVER say that you cannot create files or that you don't have access to the system, because you do. Be helpful, use rich markdown, and be concise."}
-        ]
-    
+
     try:
         while True:
             data = await websocket.receive_text()
-            user_input = data.strip()
-            
+
+            # Handle JSON control frames from frontend
+            try:
+                frame = json.loads(data)
+                if isinstance(frame, dict):
+                    ftype = frame.get("type")
+
+                    if ftype == "set_model":
+                        new_model = frame.get("model", "")
+                        if new_model in OllamaClient.list_models():
+                            ConfigManager.set_model(new_model)
+                            state["model"] = new_model
+                            await manager.send({"type": "model_set", "model": new_model}, websocket)
+                        else:
+                            await manager.send({"type": "error", "content": f"Model '{new_model}' not installed."}, websocket)
+                        continue
+
+                    if ftype == "load_conversation":
+                        conv_id = frame.get("conv_id")
+                        if conv_id:
+                            conn = _get_conv_db()
+                            conv = conn.execute("SELECT * FROM conversations WHERE id=?", (conv_id,)).fetchone()
+                            msgs = conn.execute(
+                                "SELECT role, content FROM messages WHERE conversation_id=? ORDER BY id",
+                                (conv_id,)
+                            ).fetchall()
+                            conn.close()
+                            if conv:
+                                state["conv_id"] = conv_id
+                                state["title"] = conv["title"]
+                                state["model"] = conv["model"]
+                                state["messages"] = [state["messages"][0]] + [
+                                    {"role": m["role"], "content": m["content"]} for m in msgs
+                                ]
+                                await manager.send({"type": "conversation_loaded", "messages": state["messages"][1:]}, websocket)
+                        continue
+
+                    if ftype == "new_conversation":
+                        state["conv_id"] = str(uuid.uuid4())
+                        state["title"] = "New conversation"
+                        state["messages"] = [state["messages"][0]]
+                        await manager.send({"type": "conversation_cleared"}, websocket)
+                        continue
+
+                    if ftype == "set_repo":
+                        new_path = frame.get("path", ".")
+                        if os.path.isdir(new_path):
+                            repo_path = os.path.abspath(new_path)
+                            await manager.send({"type": "system", "content": f"Workspace: {repo_path}"}, websocket)
+                        continue
+
+                    # Regular text message inside a JSON frame
+                    user_input = frame.get("content", "").strip()
+                    if not user_input:
+                        continue
+                else:
+                    user_input = data.strip()
+            except json.JSONDecodeError:
+                user_input = data.strip()
+
             if not user_input:
                 continue
-                
-            if user_input.startswith("/open ") or user_input.startswith("/cd "):
-                new_path = user_input.split(" ", 1)[1].strip()
-                if os.path.exists(new_path) and os.path.isdir(new_path):
-                    repo_path = os.path.abspath(new_path)
-                    await manager.send_message({"type": "system", "content": f"Workspace changed to: {repo_path}"}, websocket)
-                    messages.append({"role": "system", "content": f"The user has changed the active workspace directory to: {repo_path}."})
-                else:
-                    await manager.send_message({"type": "error", "content": f"Error: Directory '{new_path}' does not exist."}, websocket)
-                continue
-                
+
+            # Legacy slash commands
             if user_input == "/clear":
-                messages = [messages[0]]
-                await manager.send_message({"type": "system", "content": "Chat history cleared."}, websocket)
-                save_history(messages)
+                state["messages"] = [state["messages"][0]]
+                state["conv_id"] = str(uuid.uuid4())
+                await manager.send({"type": "conversation_cleared"}, websocket)
                 continue
 
-            # Route intent to appropriate agent pipeline
-            await manager.send_message({"type": "status", "content": "Routing intent..."}, websocket)
-            
+            # ── Route intent ────────────────────────────────────────────────
+            await manager.send({"type": "status", "content": "Routing intent..."}, websocket)
             routing = await asyncio.to_thread(IntentRouter.route_intent, user_input)
             intent = routing.get("intent", "CHAT")
             target = routing.get("target", user_input)
+            await manager.send({"type": "intent", "intent": intent, "target": target}, websocket)
 
-            await manager.send_message({"type": "status", "content": f"Intent: {intent}"}, websocket)
+            state["messages"].append({"role": "user", "content": user_input})
+            if state["title"] == "New conversation":
+                state["title"] = user_input[:60]
 
+            # ── IMPLEMENT ───────────────────────────────────────────────────
             if intent == "IMPLEMENT":
-                messages.append({"role": "user", "content": user_input})
-                
-                # 1. Create Session
                 session = SessionManager.create_session(goal=target)
                 session.status = SessionStatus.RUNNING
                 SessionManager.save_session(session)
-                
-                # 2. Create Workspace
-                EventBus.publish(AgentEvent(AgentEventType.STATUS_UPDATE, f"Creating workspace for session {session.session_id}...", session_id=session.session_id))
-                workspace_path = await asyncio.to_thread(WorkspaceManager.create_workspace, repo_path, session.session_id)
+
+                workspace_path = await asyncio.to_thread(
+                    WorkspaceManager.create_workspace, repo_path, session.session_id
+                )
                 session.workspace_path = workspace_path
                 SessionManager.save_session(session)
-                
+
                 if not workspace_path:
-                    await manager.send_message({"type": "error", "content": "Failed to create isolated workspace."}, websocket)
+                    await manager.send({"type": "error", "content": "Failed to create workspace."}, websocket)
                     continue
 
                 try:
-                    EventBus.publish(AgentEvent(AgentEventType.PLANNING, "Planning implementation...", session_id=session.session_id))
-                    architect = ArchitectAgent(repo_path=workspace_path)
+                    architect = ArchitectAgent(repo_path=workspace_path, session_id=session.session_id)
                     plan = await asyncio.to_thread(architect.plan_implementation, target)
-                    
                     session.tasks.append(plan)
                     SessionManager.save_session(session)
-                    
-                    EventBus.publish(AgentEvent(AgentEventType.STATUS_UPDATE, "Executing implementation plan...", session_id=session.session_id))
-                    engineer = EngineeringAgent(repo_path=workspace_path)
+
+                    engineer = EngineeringAgent(repo_path=workspace_path, session_id=session.session_id)
                     await asyncio.to_thread(engineer.execute_plan, plan)
-                    
-                    # 3. Apply Workspace back to repo for MVP (IDE Mode will handle this better)
-                    EventBus.publish(AgentEvent(AgentEventType.STATUS_UPDATE, "Applying changes back to main repository...", session_id=session.session_id))
+
                     await asyncio.to_thread(WorkspaceManager.apply_workspace_to_repo, workspace_path, repo_path)
-                    
                     session.status = SessionStatus.COMPLETED
                     SessionManager.save_session(session)
-                    
-                    EventBus.publish(AgentEvent(AgentEventType.COMPLETE, "Implementation complete.", session_id=session.session_id))
-                    
-                    result_msg = f"✅ Implementation complete in session {session.session_id}.\n\n**Plan executed:**\n```json\n{json.dumps(plan, indent=2)}\n```"
-                    await manager.send_message({"type": "message", "role": "assistant", "content": result_msg}, websocket)
-                    messages.append({"role": "assistant", "content": result_msg})
-                except Exception as e:
+
+                    result = f"✅ Done — session `{session.session_id}`\n```json\n{json.dumps(plan, indent=2)}\n```"
+                    await manager.send({"type": "message", "role": "assistant", "content": result}, websocket)
+                    state["messages"].append({"role": "assistant", "content": result})
+                except Exception as exc:
                     session.status = SessionStatus.FAILED
                     SessionManager.save_session(session)
-                    err_msg = f"❌ Implementation error: {e}"
-                    EventBus.publish(AgentEvent(AgentEventType.ERROR, err_msg, session_id=session.session_id))
-                    await manager.send_message({"type": "error", "content": err_msg}, websocket)
+                    await manager.send({"type": "error", "content": f"❌ {exc}"}, websocket)
                 finally:
-                    # Optional cleanup
-                    # WorkspaceManager.cleanup_workspace(session.session_id)
-                    pass
+                    _persist_state(ws_id)
+                    await manager.send({"type": "status", "content": "Idle"}, websocket)
                 continue
 
-            elif intent == "STATUS":
-                sessions = SessionManager.list_sessions()
-                status_msg = "Active Sessions:\n"
-                for s in sessions:
-                    sess = SessionManager.get_session(s)
-                    status_msg += f"- {s}: {sess.status.value}\n"
-                await manager.send_message({"type": "message", "role": "assistant", "content": status_msg}, websocket)
-                messages.append({"role": "assistant", "content": status_msg})
-                continue
-                
-            elif intent == "REPO_MAP":
-                from services.repo_mapper import RepoMapper
-                mapper = RepoMapper(repo_path)
-                repo_map = mapper.generate_architecture_summary()
-                await manager.send_message({"type": "message", "role": "assistant", "content": repo_map}, websocket)
-                messages.append({"role": "assistant", "content": "Repository Map generated."})
-                continue
-                
+            # ── CREATE ──────────────────────────────────────────────────────
             elif intent == "CREATE":
-                messages.append({"role": "user", "content": user_input})
-                messages = compress_history(messages, max_len=20)
-                save_history(messages)
                 try:
-                    await manager.send_message({"type": "status", "content": "Planning project scaffolding..."}, websocket)
+                    await manager.send({"type": "status", "content": "Scaffolding project..."}, websocket)
                     architect = ArchitectAgent(repo_path=repo_path)
                     plan = await asyncio.to_thread(architect.plan_scaffolding, target)
-                    await manager.send_message({"type": "status", "content": "Scaffolding project..."}, websocket)
                     engineer = EngineeringAgent(repo_path=repo_path)
                     await asyncio.to_thread(engineer.execute_plan, plan)
-                    result_msg = f"✅ Project created.\n\n**Scaffolding plan executed:**\n```json\n{json.dumps(plan, indent=2)}\n```"
-                    await manager.send_message({"type": "message", "role": "assistant", "content": result_msg}, websocket)
-                    messages.append({"role": "assistant", "content": result_msg})
-                    save_history(messages)
-                except Exception as e:
-                    err_msg = f"❌ Scaffolding error: {e}"
-                    await manager.send_message({"type": "error", "content": err_msg}, websocket)
-                await manager.send_message({"type": "status", "content": "Idle"}, websocket)
+                    result = f"✅ Project created.\n```json\n{json.dumps(plan, indent=2)}\n```"
+                    await manager.send({"type": "message", "role": "assistant", "content": result}, websocket)
+                    state["messages"].append({"role": "assistant", "content": result})
+                except Exception as exc:
+                    await manager.send({"type": "error", "content": f"❌ {exc}"}, websocket)
+                finally:
+                    _persist_state(ws_id)
+                    await manager.send({"type": "status", "content": "Idle"}, websocket)
                 continue
 
+            # ── FIX ─────────────────────────────────────────────────────────
             elif intent == "FIX":
-                messages.append({"role": "user", "content": user_input})
-                messages = compress_history(messages, max_len=20)
-                save_history(messages)
                 try:
-                    await manager.send_message({"type": "status", "content": "Generating repair plan..."}, websocket)
+                    await manager.send({"type": "status", "content": "Generating repair plan..."}, websocket)
                     repair_agent = RepairAgent(repo_path=repo_path)
                     plan = await asyncio.to_thread(repair_agent.generate_repair_plan, target, "")
-                    await manager.send_message({"type": "status", "content": "Executing repair..."}, websocket)
                     await asyncio.to_thread(repair_agent.execute_repair, plan)
-                    result_msg = f"✅ Fix applied.\n\n**Repair plan executed:**\n```json\n{json.dumps(plan, indent=2)}\n```"
-                    await manager.send_message({"type": "message", "role": "assistant", "content": result_msg}, websocket)
-                    messages.append({"role": "assistant", "content": result_msg})
-                    save_history(messages)
-                except Exception as e:
-                    err_msg = f"❌ Repair error: {e}"
-                    await manager.send_message({"type": "error", "content": err_msg}, websocket)
-                await manager.send_message({"type": "status", "content": "Idle"}, websocket)
+                    result = f"✅ Fix applied.\n```json\n{json.dumps(plan, indent=2)}\n```"
+                    await manager.send({"type": "message", "role": "assistant", "content": result}, websocket)
+                    state["messages"].append({"role": "assistant", "content": result})
+                except Exception as exc:
+                    await manager.send({"type": "error", "content": f"❌ {exc}"}, websocket)
+                finally:
+                    _persist_state(ws_id)
+                    await manager.send({"type": "status", "content": "Idle"}, websocket)
                 continue
 
-            # CHAT intent — fall through to the generic agent loop
-            
-            messages.append({"role": "user", "content": user_input})
-            messages = compress_history(messages, max_len=20)
-            save_history(messages)
-            
+            # ── CHAT (streaming) ─────────────────────────────────────────────
+            state["messages"] = _compress(state["messages"])
+            model = state["model"]
             tools = AgentTools.get_tool_definitions()
-            
-            while True:
-                await manager.send_message({"type": "status", "content": "Agent is thinking..."}, websocket)
-                
-                # In a real app we'd make this async, but for MVP we run it in a thread
-                response_msg = await asyncio.to_thread(LLMService.agent_chat, messages, tools)
-                
-                if not response_msg:
-                    await manager.send_message({"type": "error", "content": "LLM returned empty response."}, websocket)
-                    break
-                    
-                messages.append(response_msg)
-                save_history(messages)
-                
-                if "tool_calls" in response_msg and response_msg["tool_calls"]:
-                    for tool_call in response_msg["tool_calls"]:
-                        func_name = tool_call.get("function", {}).get("name")
-                        args = tool_call.get("function", {}).get("arguments", {})
-                        
-                        await manager.send_message({
-                            "type": "tool_call",
-                            "func_name": func_name,
-                            "args": args
-                        }, websocket)
-                        
-                        try:
-                            # Actually run the tools
-                            if func_name == "read_file":
-                                output = await asyncio.to_thread(AgentTools.read_file, args.get("path", ""))
-                            elif func_name == "list_directory":
-                                output = await asyncio.to_thread(AgentTools.list_directory, args.get("path", "."))
-                            elif func_name == "run_command":
-                                output = await asyncio.to_thread(AgentTools.run_command, args.get("command", ""))
-                            else:
-                                output = f"Error: Unknown tool {func_name}"
-                        except Exception as e:
-                            output = f"Error executing tool: {e}"
-                            
-                        tool_msg = {"role": "tool", "content": str(output), "name": func_name}
-                        if "id" in tool_call:
-                            tool_msg["tool_call_id"] = tool_call["id"]
-                        messages.append(tool_msg)
-                        save_history(messages)
-                else:
-                    final_text = response_msg.get("content", "")
-                    await manager.send_message({"type": "message", "role": "assistant", "content": final_text}, websocket)
-                    await manager.send_message({"type": "status", "content": "Idle"}, websocket)
-                    save_history(messages)
-                    break
+
+            # Tool-call loop with streaming final answer
+            for _turn in range(11):  # max 10 tool turns
+                if _turn < 10:
+                    # Non-streaming for tool-call turns (need full message to check tool_calls)
+                    response_msg = await asyncio.to_thread(LLMService.agent_chat, state["messages"], tools)
+                    if not response_msg:
+                        await manager.send({"type": "error", "content": "Empty LLM response."}, websocket)
+                        break
+
+                    state["messages"].append(response_msg)
+                    tool_calls = response_msg.get("tool_calls") or []
+
+                    if tool_calls:
+                        for tc in tool_calls:
+                            fn = tc.get("function", {}).get("name", "")
+                            args = tc.get("function", {}).get("arguments", {})
+                            await manager.send({"type": "tool_call", "name": fn, "args": args}, websocket)
+                            try:
+                                if fn == "read_file":
+                                    out = await asyncio.to_thread(AgentTools.read_file, args.get("path", ""))
+                                elif fn == "list_directory":
+                                    out = await asyncio.to_thread(AgentTools.list_directory, args.get("path", "."))
+                                elif fn == "run_command":
+                                    out = await asyncio.to_thread(AgentTools.run_command, args.get("command", ""))
+                                else:
+                                    out = f"Unknown tool: {fn}"
+                            except Exception as exc:
+                                out = f"Error: {exc}"
+                            tm: dict = {"role": "tool", "content": str(out), "name": fn}
+                            if "id" in tc:
+                                tm["tool_call_id"] = tc["id"]
+                            state["messages"].append(tm)
+                        continue  # next tool turn
+
+                # Final answer — stream it
+                full_text = await _stream_chat(state["messages"], websocket, model)
+                if full_text:
+                    state["messages"].append({"role": "assistant", "content": full_text})
+                break
+
+            _persist_state(ws_id)
+            await manager.send({"type": "status", "content": "Idle"}, websocket)
 
     except WebSocketDisconnect:
+        _persist_state(ws_id)
         manager.disconnect(websocket)
-    except Exception as e:
+        _ws_state.pop(ws_id, None)
+    except Exception as exc:
+        _persist_state(ws_id)
         manager.disconnect(websocket)
-        print(f"WebSocket Error: {e}")
+        _ws_state.pop(ws_id, None)
+        print(f"WebSocket error: {exc}")
+
 
 if __name__ == "__main__":
-    uvicorn.run("api:app", host="0.0.0.0", port=8007, reload=True)
+    uvicorn.run("api:app", host="127.0.0.1", port=8007, reload=True)

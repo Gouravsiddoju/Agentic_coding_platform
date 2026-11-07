@@ -8,7 +8,7 @@ class SandboxManager:
     def __init__(self, workspace_path: str, use_docker: bool = True):
         self.workspace_path = os.path.abspath(workspace_path)
         self.use_docker = use_docker
-        self.container_name = f"optcode-sandbox-{uuid.uuid4().hex[:8]}"
+        self.container_name = f"codeme-sandbox-{uuid.uuid4().hex[:8]}"
         
         # Destructive commands to block in local mode
         self.banned_commands = ["rm -rf /", "mkfs", "dd", "format", "shutdown", "reboot"]
@@ -71,15 +71,21 @@ class SandboxManager:
             except Exception as e:
                 return {"success": False, "stdout": "", "stderr": str(e), "returncode": 1}
         else:
-            # Run locally
+            # Run locally (Docker not available)
+            import shlex
             try:
+                try:
+                    cmd_parts = shlex.split(command, posix=True)
+                except ValueError:
+                    cmd_parts = shlex.split(command, posix=False)
+
                 result = subprocess.run(
-                    command,
+                    cmd_parts,
                     cwd=self.workspace_path,
-                    shell=True,
+                    shell=False,
                     capture_output=True,
                     text=True,
-                    timeout=timeout
+                    timeout=timeout,
                 )
                 return {
                     "success": result.returncode == 0,

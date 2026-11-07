@@ -1,12 +1,12 @@
 {
-  "name": "@optcode/desktop",
+  "name": "@codeme/desktop",
   "version": "1.34.0",
-  "productName": "OptCode",
-  "description": "OptCode Internal Desktop Application",
+  "productName": "CodeMe",
+  "description": "CodeMe — Agentic Coding Platform",
   "type": "module",
   "main": "dist-server/server/index.js",
   "bin": {
-    "optcode": "dist-server/server/cli.js"
+    "codeme": "dist-server/server/cli.js"
   },
   "files": [
     "electron/",
@@ -18,13 +18,13 @@
     "scripts/",
     "README.md"
   ],
-  "homepage": "https://optcode.internal",
+  "homepage": "https://codeme.dev",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/optcode/desktop.git"
+    "url": "git+https://github.com/Gouravsiddoju/Agentic_coding_platform.git"
   },
   "bugs": {
-    "url": "https://github.com/optcode/desktop/issues"
+    "url": "https://github.com/Gouravsiddoju/Agentic_coding_platform/issues"
   },
   "scripts": {
     "dev": "concurrently --kill-others \"npm run server:dev\" \"npm run client\"",
@@ -53,10 +53,10 @@
   },
   "build": {
     "npmRebuild": false,
-    "appId": "ai.optcode.desktop",
+    "appId": "dev.codeme.desktop",
     "asar": false,
-    "productName": "OptCode",
-    "artifactName": "OptCode-${version}-${arch}.${ext}",
+    "productName": "CodeMe",
+    "artifactName": "CodeMe-${version}-${arch}.${ext}",
     "directories": {
       "output": "release"
     },
@@ -80,9 +80,9 @@
     ],
     "protocols": [
       {
-        "name": "OptCode",
+        "name": "CodeMe",
         "schemes": [
-          "optcode"
+          "codeme"
         ]
       }
     ],
@@ -93,13 +93,13 @@
         "zip"
       ],
       "extendInfo": {
-        "CFBundleName": "OptCode",
-        "CFBundleDisplayName": "OptCode",
+        "CFBundleName": "CodeMe",
+        "CFBundleDisplayName": "CodeMe",
         "CFBundleURLTypes": [
           {
-            "CFBundleURLName": "OptCode",
+            "CFBundleURLName": "CodeMe",
             "CFBundleURLSchemes": [
-              "optcode"
+              "codeme"
             ]
           }
         ]
@@ -119,11 +119,11 @@
     }
   },
   "keywords": [
-    "optcode",
+    "codeme",
     "internal",
     "agentic"
   ],
-  "author": "TechOptima",
+  "author": "Gourav Siddoju",
   "license": "UNLICENSED",
   "dependencies": {
     "@anthropic-ai/claude-agent-sdk": "^0.3.165",
@@ -233,3 +233,5 @@
     "server/**/*.{js,ts}": "eslint"
   }
 }
+
+

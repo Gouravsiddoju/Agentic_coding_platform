@@ -5,7 +5,7 @@ import subprocess
 from typing import Optional
 
 class WorkspaceManager:
-    WORKSPACES_DIR = ".optcode_workspaces"
+    WORKSPACES_DIR = ".codeme_workspaces"
 
     @classmethod
     def _ensure_dir(cls):
@@ -27,8 +27,7 @@ class WorkspaceManager:
         base_repo_path = os.path.abspath(base_repo_path)
         
         def ignore_patterns(path, names):
-            # Ignore specific large or temp directories when cloning locally
-            ignored = {".git", "node_modules", "__pycache__", ".venv", "venv", ".optcode_db", ".optcode_workspaces"}
+            ignored = {".git", "node_modules", "__pycache__", ".venv", "venv", ".codeme_db", ".codeme_workspaces"}
             return [n for n in names if n in ignored]
 
         try:
@@ -66,7 +65,7 @@ class WorkspaceManager:
         repo_path = os.path.abspath(repo_path)
         
         def ignore_patterns(path, names):
-            ignored = {".git", ".optcode_db", ".optcode_workspaces"}
+            ignored = {".git", ".codeme_db", ".codeme_workspaces"}
             return [n for n in names if n in ignored]
             
         try:

@@ -6,7 +6,7 @@ from typing import Dict, List, Any
 class RepoMapper:
     def __init__(self, repo_path: str = "."):
         self.repo_path = os.path.abspath(repo_path)
-        self.ignore_dirs = {".git", ".venv", "__pycache__", "node_modules", ".optcode_db", ".optcode_workspaces", ".pytest_cache"}
+        self.ignore_dirs = {".git", ".venv", "__pycache__", "node_modules", ".codeme_db", ".codeme_workspaces", ".pytest_cache"}
         self.allowed_extensions = {".py"} # Focusing on Python for now for AST parsing
 
     def extract_symbols_from_python(self, file_path: str) -> Dict[str, Any]:
@@ -65,7 +65,7 @@ class RepoMapper:
                         repo_map[rel_path] = symbols
         return repo_map
 
-    def save_map(self, output_path: str = ".optcode_db/repo_map.json"):
+    def save_map(self, output_path: str = ".codeme_db/repo_map.json"):
         """Saves the map to a JSON file."""
         repo_map = self.build_map()
         os.makedirs(os.path.dirname(output_path), exist_ok=True)

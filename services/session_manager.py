@@ -56,7 +56,7 @@ class Session:
         return session
 
 class SessionManager:
-    SESSIONS_DIR = ".optcode_db/sessions"
+    SESSIONS_DIR = ".codeme_db/sessions"
     
     @classmethod
     def _ensure_dir(cls):
